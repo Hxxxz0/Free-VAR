@@ -10,6 +10,7 @@ import dist
 from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vqvae import VQVAE, VectorQuantizer2
+from models.wavelet_tokenizer import WaveletTokenizer
 
 
 class SharedAdaLin(nn.Linear):
@@ -20,12 +21,13 @@ class SharedAdaLin(nn.Linear):
 
 class VAR(nn.Module):
     def __init__(
-        self, vae_local: VQVAE,
+        self, vae_local: Union[VQVAE, WaveletTokenizer],
         num_classes=1000, depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
         norm_eps=1e-6, shared_aln=False, cond_drop_rate=0.1,
         attn_l2_norm=False,
         patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
         flash_if_available=True, fused_if_available=True,
+        use_wavelet=False, wavelet_levels=3, wavelet_vocab=4096,
     ):
         super().__init__()
         # 0. hyperparameters
@@ -47,7 +49,8 @@ class VAR(nn.Module):
         
         self.num_stages_minus_1 = len(self.patch_nums) - 1
         self.rng = torch.Generator(device=dist.get_device())
-        
+        self.use_wavelet = use_wavelet
+
         # 1. input (word) embedding
         quant: VectorQuantizer2 = vae_local.quantize
         self.vae_proxy: Tuple[VQVAE] = (vae_local,)
@@ -152,9 +155,10 @@ class VAR(nn.Module):
         
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
         next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]
-        
+
         cur_L = 0
-        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1]) if not self.use_wavelet else None
+        ms_idx = []
         
         for b in self.blocks: b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
@@ -173,21 +177,31 @@ class VAR(nn.Module):
             logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
             
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
-            if not more_smooth: # this is the default case
-                h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae
-            else:   # not used when evaluating FID/IS/Precision/Recall
-                gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
-                h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-            
-            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
-            f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
-            if si != self.num_stages_minus_1:   # prepare for next stage
-                next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
-                next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
-                next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
+            ms_idx.append(idx_Bl)
+            if not self.use_wavelet:
+                if not more_smooth:
+                    h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)
+                else:
+                    gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
+                    h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+
+                h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
+                f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
+                if si != self.num_stages_minus_1:
+                    next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
+                    next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
+                    next_token_map = next_token_map.repeat(2, 1, 1)
+            else:
+                if si != self.num_stages_minus_1:
+                    next_token_map = self.word_embed(self.vae_quant_proxy[0].embedding(idx_Bl))
+                    next_token_map = next_token_map + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
+                    next_token_map = next_token_map.repeat(2, 1, 1)
         
         for b in self.blocks: b.attn.kv_caching(False)
-        return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
+        if not self.use_wavelet:
+            return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)
+        else:
+            return self.vae_proxy[0].idxBl_to_img(ms_idx).add_(1).mul_(0.5)
     
     def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
         """
@@ -300,6 +314,7 @@ class VARHF(VAR, PyTorchModelHubMixin):
         attn_l2_norm=False,
         patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
         flash_if_available=True, fused_if_available=True,
+        use_wavelet=False, wavelet_levels=3, wavelet_vocab=4096,
     ):
         vae_local = VQVAE(**vae_kwargs)
         super().__init__(
@@ -309,4 +324,5 @@ class VARHF(VAR, PyTorchModelHubMixin):
             attn_l2_norm=attn_l2_norm,
             patch_nums=patch_nums,
             flash_if_available=flash_if_available, fused_if_available=fused_if_available,
+            use_wavelet=use_wavelet, wavelet_levels=wavelet_levels, wavelet_vocab=wavelet_vocab,
         )
