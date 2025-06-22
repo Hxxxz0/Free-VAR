@@ -8,16 +8,16 @@ from pytorch_wavelets import DTCWTForward, DTCWTInverse
 
 
 class EMAVQ(nn.Module):
-    """EMA vector-quantiser (now amplitude-phase, D=2)."""
+    """EMA vector-quantiser using amplitude/cos/sin representation."""
 
-    def __init__(self, vocab_size: int, code_dim: int = 2, decay: float = 0.99, eps: float = 1e-5):
+    def __init__(self, vocab_size: int, code_dim: int = 3, decay: float = 0.99, eps: float = 1e-5):
         super().__init__()
         self.vocab_size = vocab_size
         self.code_dim = code_dim
         self.decay = decay
         self.eps = eps
         self.embedding = nn.Embedding(vocab_size, code_dim)
-        nn.init.uniform_(self.embedding.weight, -1.0 / vocab_size, 1.0 / vocab_size)
+        nn.init.xavier_uniform_(self.embedding.weight)
         self.register_buffer("ema_cluster_size", torch.zeros(vocab_size))
         self.register_buffer("ema_weight", torch.zeros(vocab_size, code_dim))
 
@@ -55,17 +55,17 @@ class EMAVQ(nn.Module):
 
 
 class WaveletTokenizer(nn.Module):
-    """Multi-scale wavelet tokenizer using amplitude-phase VQ."""
+    """Multi-scale wavelet tokenizer using amplitude/cos/sin VQ."""
 
     def __init__(self, levels: int = 3, vocab_size: int = 4096):
         super().__init__()
         self.levels = levels
-        self.vq = EMAVQ(vocab_size, 2)   # amp + phase only
+        self.vq = EMAVQ(vocab_size, 3)   # amp + cosφ + sinφ
         self.embedding = self.vq.embedding
         self.dtcwt = DTCWTForward(J=levels, biort="near_sym_b", qshift="qshift_b")
         self.itcwt = DTCWTInverse(biort="near_sym_b", qshift="qshift_b")
         self.vocab_size = vocab_size
-        self.Cvae = 2  # amp, phase
+        self.Cvae = 3  # amp, cosφ, sinφ
         class _Proxy:
             def __init__(self, parent: 'WaveletTokenizer'):
                 self._parent = parent
@@ -84,19 +84,21 @@ class WaveletTokenizer(nn.Module):
 
     # ---------- new helpers ----------
     @staticmethod
-    def _complex_to_ap(c: torch.Tensor) -> torch.Tensor:
-        """(real, imag) → (amp, phase)"""
+    def _complex_to_acs(c: torch.Tensor) -> torch.Tensor:
+        """(real, imag) → (amp, cosφ, sinφ)"""
         real, imag = c.unbind(-1)
         amp = torch.sqrt(real ** 2 + imag ** 2)
-        phase = torch.atan2(imag, real)
-        return torch.stack((amp, phase), dim=-1)
+        denom = amp + 1e-8
+        cos = real / denom
+        sin = imag / denom
+        return torch.stack((amp, cos, sin), dim=-1)
 
     @staticmethod
-    def _ap_to_complex(ap: torch.Tensor) -> torch.Tensor:
-        """(amp, phase) → (real, imag)"""
-        amp, phase = ap.unbind(-1)
-        real = amp * torch.cos(phase)
-        imag = amp * torch.sin(phase)
+    def _acs_to_complex(acs: torch.Tensor) -> torch.Tensor:
+        """(amp, cosφ, sinφ) → (real, imag)"""
+        amp, cos, sin = acs.unbind(-1)
+        real = amp * cos
+        imag = amp * sin
         return torch.stack((real, imag), dim=-1)
 
     def img_to_idxBl(self, img: torch.Tensor) -> Tuple[List[torch.Tensor], List[Tuple[int, int, int, int]]]:
@@ -108,43 +110,42 @@ class WaveletTokenizer(nn.Module):
             B, C, O, H, W, _ = h.shape
             shapes_local.append((C, O, H, W))
             q = (
-                self._complex_to_ap(h)
-                .permute(0, 3, 4, 2, 1, 5)  # B H W O C 2
-                .reshape(B, -1, 2)
+                self._complex_to_acs(h)
+                .permute(0, 3, 4, 2, 1, 5)  # B H W O C 3
+                .reshape(B, -1, 3)
             )
             _, idx, _ = self.vq(q)
             idx_ls.append(idx)
         B, C, H, W = yl.shape
-        amp = yl.abs()
-        phase = torch.zeros_like(yl)
         shapes_local.append((C, 1, H, W))
-        low = torch.stack((amp, phase), dim=-1)
-        _, idx, _ = self.vq(low.permute(0, 2, 3, 1, 4).reshape(B, -1, 2))
+        low_c = torch.stack((yl, torch.zeros_like(yl)), dim=-1)
+        low = self._complex_to_acs(low_c).unsqueeze(2)
+        _, idx, _ = self.vq(low.permute(0, 3, 4, 2, 1, 5).reshape(B, -1, 3))
         idx_ls.append(idx)
         return idx_ls, shapes_local
 
     def idxBl_to_img(self, ms_idx_Bl: List[torch.Tensor], shapes) -> torch.Tensor:
         """Decode tokens back to image."""
-        device = ms_idx_Bl[0].device
         yh = []
         for i, idx in enumerate(ms_idx_Bl[:-1]):
             C, O, H, W = shapes[i]
             B = idx.shape[0]
             ap = (
                 self.embedding(idx)
-                .reshape(B, H, W, O, C, 2)
+                .reshape(B, H, W, O, C, 3)
                 .permute(0, 4, 3, 1, 2, 5)
         )
-            c = self._ap_to_complex(ap)
+            c = self._acs_to_complex(ap)
             yh.append(c)
         C, _, H, W = shapes[-1]
         B = ms_idx_Bl[-1].shape[0]
         ap_low = (
             self.embedding(ms_idx_Bl[-1])
-            .reshape(B, H, W, 1, C, 2)
+            .reshape(B, H, W, 1, C, 3)
             .permute(0, 4, 3, 1, 2, 5)
         )
-        yl = self._ap_to_complex(ap_low)[..., 0]          # take real part
+        yl = self._acs_to_complex(ap_low)[..., 0]
+        yl = yl.squeeze(2)
         img = self.itcwt((yl, yh))
         return img.clamp(-1, 1)
 
