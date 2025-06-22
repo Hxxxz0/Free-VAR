@@ -53,6 +53,8 @@ class VAR(nn.Module):
 
         # 1. input (word) embedding
         quant: VectorQuantizer2 = vae_local.quantize
+        if use_wavelet:
+            vae_local.v_patch_nums = patch_nums
         self.vae_proxy: Tuple[VQVAE] = (vae_local,)
         self.vae_quant_proxy: Tuple[VectorQuantizer2] = (quant,)
         self.word_embed = nn.Linear(self.Cvae, self.C)
@@ -157,7 +159,7 @@ class VAR(nn.Module):
         next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]
 
         cur_L = 0
-        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1]) if not self.use_wavelet else None
+        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
         ms_idx = []
         
         for b in self.blocks: b.attn.kv_caching(True)
@@ -178,24 +180,18 @@ class VAR(nn.Module):
             
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
             ms_idx.append(idx_Bl)
-            if not self.use_wavelet:
-                if not more_smooth:
-                    h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)
-                else:
-                    gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
-                    h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-
-                h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
-                f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
-                if si != self.num_stages_minus_1:
-                    next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
-                    next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
-                    next_token_map = next_token_map.repeat(2, 1, 1)
+            if not more_smooth:
+                h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)
             else:
-                if si != self.num_stages_minus_1:
-                    next_token_map = self.word_embed(self.vae_quant_proxy[0].embedding(idx_Bl))
-                    next_token_map = next_token_map + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
-                    next_token_map = next_token_map.repeat(2, 1, 1)
+                gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
+                h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+
+            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
+            f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
+            if si != self.num_stages_minus_1:
+                next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
+                next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
+                next_token_map = next_token_map.repeat(2, 1, 1)
         
         for b in self.blocks: b.attn.kv_caching(False)
         if not self.use_wavelet:
