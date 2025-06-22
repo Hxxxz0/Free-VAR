@@ -77,7 +77,7 @@ class WaveletTokenizer(nn.Module):
                 return self._parent.get_next_autoregressive_input(si, SN, f_hat, h_BChw)
 
         self.quantize = _Proxy(self)  # lightweight proxy for trainer compatibility
-        self.shapes: List[Tuple[int, int]] = []
+        self.shapes: List[Tuple[int, int, int, int]] = []
 
     @staticmethod
     def _complex_to_quaternion(c: torch.Tensor) -> torch.Tensor:
@@ -88,9 +88,8 @@ class WaveletTokenizer(nn.Module):
 
     @staticmethod
     def _quaternion_to_complex(q: torch.Tensor) -> torch.Tensor:
-        amp, phase = q[..., 2], q[..., 3]
-        real = amp * torch.cos(phase)
-        imag = amp * torch.sin(phase)
+        real = q[..., 0]
+        imag = q[..., 1]
         return torch.stack((real, imag), dim=-1)
 
     def img_to_idxBl(self, img: torch.Tensor) -> List[torch.Tensor]:
@@ -100,7 +99,7 @@ class WaveletTokenizer(nn.Module):
         idx_ls: List[torch.Tensor] = []
         for h in yh:
             B, C, O, H, W, _ = h.shape
-            self.shapes.append((C, H, W))
+            self.shapes.append((C, O, H, W))
             q = (
                 self._complex_to_quaternion(h)
                 .permute(0, 3, 4, 2, 1, 5)  # B H W O C 4
@@ -109,9 +108,10 @@ class WaveletTokenizer(nn.Module):
             _, idx, _ = self.vq(q)
             idx_ls.append(idx)
         B, C, H, W = yl.shape
-        self.shapes.append((C, H, W))
+        self.shapes.append((C, 1, H, W))
+        amp = yl.abs()
         low = torch.stack(
-            (yl, torch.zeros_like(yl), torch.zeros_like(yl), torch.zeros_like(yl)),
+            (yl, torch.zeros_like(yl), amp, torch.zeros_like(yl)),
             dim=-1,
         )  # B C H W 4
         _, idx, _ = self.vq(low.permute(0, 2, 3, 1, 4).reshape(B, -1, 4))
@@ -122,18 +122,18 @@ class WaveletTokenizer(nn.Module):
         """Decode tokens back to image."""
         yh = []
         for i, idx in enumerate(ms_idx_Bl[:-1]):
-            C, H, W = self.shapes[i]
+            C, O, H, W = self.shapes[i]
             q = (
                 self.embedding(idx)
-                .view(-1, H, W, 6, C, 4)  # B H W O C 4
+                .view(idx.shape[0], H, W, O, C, 4)  # B H W O C 4
                 .permute(0, 4, 3, 1, 2, 5)
             )
             c = self._quaternion_to_complex(q)
             yh.append(c)
-        C, H, W = self.shapes[-1]
+        C, _, H, W = self.shapes[-1]
         q_low = (
             self.embedding(ms_idx_Bl[-1])
-            .view(-1, H, W, C, 4)
+            .view(ms_idx_Bl[-1].shape[0], H, W, C, 4)
             .permute(0, 3, 1, 2, 4)
         )
         yl = q_low[..., 0]
