@@ -66,6 +66,7 @@ class WaveletTokenizer(nn.Module):
         self.itcwt = DTCWTInverse(biort="near_sym_b", qshift="qshift_b")
         self.vocab_size = vocab_size
         self.Cvae = 3  # amp, cosφ, sinφ
+        self.v_patch_nums: Tuple[int, ...] = ()
         class _Proxy:
             def __init__(self, parent: 'WaveletTokenizer'):
                 self._parent = parent
@@ -155,4 +156,13 @@ class WaveletTokenizer(nn.Module):
         return torch.cat(feats, dim=1) if feats else None
 
     def get_next_autoregressive_input(self, si: int, SN: int, f_hat: torch.Tensor, h_BChw: torch.Tensor):
-        return None, h_BChw
+        """Accumulate reconstruction and give next-scale features."""
+        HW = f_hat.shape[-1]
+        if si != SN - 1:
+            h = F.interpolate(h_BChw, size=(HW, HW), mode="bicubic")
+            f_hat.add_(h)
+            pn_next = self.v_patch_nums[si + 1]
+            return f_hat, F.interpolate(f_hat, size=(pn_next, pn_next), mode="area")
+        else:
+            f_hat.add_(h_BChw)
+            return f_hat, f_hat
