@@ -83,7 +83,7 @@ def build_everything(args: arg_util.Args):
     from utils.lr_control import filter_params
     
     if args.wavelet:
-        vae_local = WaveletTokenizer(levels=args.wlevels, vocab_size=args.wvocab)
+        vae_local = WaveletTokenizer(levels=args.wlevels, vocab_size=args.wvocab, patch_nums=args.wavelet_patch_nums)
         var_wo_ddp = VAR(
             vae_local=vae_local,
             num_classes=num_classes, depth=args.depth, embed_dim=args.depth * 64,
@@ -91,7 +91,7 @@ def build_everything(args: arg_util.Args):
             norm_eps=1e-6, shared_aln=args.saln, cond_drop_rate=0.1,
             attn_l2_norm=args.anorm, patch_nums=args.patch_nums,
             flash_if_available=args.fuse, fused_if_available=args.fuse,
-            use_wavelet=True, wavelet_levels=args.wlevels, wavelet_vocab=args.wvocab,
+            use_wavelet=True, wavelet_levels=args.wlevels, wavelet_vocab=args.wvocab, wavelet_patch_nums=args.wavelet_patch_nums,
         )
         vae_local = args.compile_model(vae_local, args.vfast)
         var_wo_ddp = args.compile_model(var_wo_ddp, args.tfast)
