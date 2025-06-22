@@ -57,7 +57,7 @@ class EMAVQ(nn.Module):
 class WaveletTokenizer(nn.Module):
     """Multi-scale wavelet tokenizer using amplitude/cos/sin VQ."""
 
-    def __init__(self, levels: int = 3, vocab_size: int = 4096, patch_nums=None):
+    def __init__(self, levels: int = 3, vocab_size: int = 4096):
         super().__init__()
         self.levels = levels
         self.vq = EMAVQ(vocab_size, 3)   # amp + cosφ + sinφ
@@ -66,7 +66,6 @@ class WaveletTokenizer(nn.Module):
         self.itcwt = DTCWTInverse(biort="near_sym_b", qshift="qshift_b")
         self.vocab_size = vocab_size
         self.Cvae = 3  # amp, cosφ, sinφ
-        self.patch_nums = patch_nums
         class _Proxy:
             def __init__(self, parent: 'WaveletTokenizer'):
                 self._parent = parent
@@ -101,23 +100,6 @@ class WaveletTokenizer(nn.Module):
         real = amp * cos
         imag = amp * sin
         return torch.stack((real, imag), dim=-1)
-
-    def calc_token_lens(self, image_size: int, subsample: int = 1) -> List[int]:
-        """Return token lengths for each level given image size and subsampling."""
-        with torch.no_grad():
-            dummy = torch.zeros(1, 3, image_size, image_size, device=self.embedding.weight.device)
-            yl, yh = self.dtcwt(dummy)
-        lens: List[int] = []
-        for h in yh:
-            _, C, O, H, W, _ = h.shape
-            H = math.ceil(H / subsample)
-            W = math.ceil(W / subsample)
-            lens.append(C * O * H * W)
-        C, H, W = yl.shape[1:]
-        H = math.ceil(H / subsample)
-        W = math.ceil(W / subsample)
-        lens.append(C * H * W)
-        return lens
 
     def img_to_idxBl(self, img: torch.Tensor) -> Tuple[List[torch.Tensor], List[Tuple[int, int, int, int]]]:
         """Decompose image and quantize to token indices."""
@@ -169,14 +151,7 @@ class WaveletTokenizer(nn.Module):
 
     # ===== functions used by VAR trainer =====
     def idxBl_to_var_input(self, gt_ms_idx_Bl: List[torch.Tensor]) -> torch.Tensor:
-        feats = []
-        for si, idx in enumerate(gt_ms_idx_Bl[:-1]):
-            emb = self.embedding(idx)
-            if self.patch_nums is not None and si + 1 < len(self.patch_nums):
-                tgt = self.patch_nums[si + 1] ** 2
-                if emb.shape[1] != tgt:
-                    emb = F.interpolate(emb.transpose(1, 2), size=tgt, mode='linear', align_corners=False).transpose(1, 2)
-            feats.append(emb)
+        feats = [self.embedding(idx) for idx in gt_ms_idx_Bl[:-1]]
         return torch.cat(feats, dim=1) if feats else None
 
     def get_next_autoregressive_input(self, si: int, SN: int, f_hat: torch.Tensor, h_BChw: torch.Tensor):
