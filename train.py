@@ -96,15 +96,7 @@ def build_everything(args: arg_util.Args):
             os.system(f'wget https://huggingface.co/FoundationVision/var/resolve/main/{vae_ckpt}')
     dist.barrier()
     vae_local.load_state_dict(torch.load(vae_ckpt, map_location='cpu'), strict=True)
-
-    if args.exp_name == 'wavelet':
-        vae_local = vae_local.to(dist.get_device())
-        var_wo_ddp = var_wo_ddp.to(dist.get_device())
-        var_wo_ddp.init_weights(
-            init_adaln=args.aln, init_adaln_gamma=args.alng,
-            init_head=args.hd, init_std=args.ini,
-        )
-
+    
     vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
     var_wo_ddp: VAR = args.compile_model(var_wo_ddp, args.tfast)
     var: DDP = (DDP if dist.initialized() else NullDDP)(var_wo_ddp, device_ids=[dist.get_local_rank()], find_unused_parameters=False, broadcast_buffers=False)
