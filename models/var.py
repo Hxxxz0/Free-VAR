@@ -28,6 +28,7 @@ class VAR(nn.Module):
         patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
         flash_if_available=True, fused_if_available=True,
         use_wavelet=False, wavelet_levels=3, wavelet_vocab=4096,
+        wavelet_patch_nums=None,
     ):
         super().__init__()
         # 0. hyperparameters
@@ -38,7 +39,13 @@ class VAR(nn.Module):
         self.cond_drop_rate = cond_drop_rate
         self.prog_si = -1   # progressive training
         
-        self.patch_nums: Tuple[int] = patch_nums
+        self.patch_nums: Tuple[int]
+        if use_wavelet and wavelet_patch_nums is not None:
+            self.patch_nums = tuple(wavelet_patch_nums)
+            if hasattr(vae_local, 'patch_nums'):
+                vae_local.patch_nums = self.patch_nums
+        else:
+            self.patch_nums = patch_nums
         self.L = sum(pn ** 2 for pn in self.patch_nums)
         self.first_l = self.patch_nums[0] ** 2
         self.begin_ends = []
