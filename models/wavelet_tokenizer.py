@@ -66,6 +66,14 @@ class WaveletTokenizer(nn.Module):
         self.itcwt = DTCWTInverse(biort="near_sym_b", qshift="qshift_b")
         self.vocab_size = vocab_size
         self.Cvae = 3  # amp, cosφ, sinφ
+        if patch_nums is None:
+            raise ValueError(
+                "WaveletTokenizer requires `patch_nums` (provide via --wpatch)."
+            )
+        if len(patch_nums) != levels + 1:
+            raise ValueError(
+                f"patch_nums length {len(patch_nums)} must equal levels+1={levels+1}"
+            )
         self.patch_nums = patch_nums
         self.register_buffer('amp_mu', torch.zeros(levels))
         self.register_buffer('amp_std', torch.ones(levels))
