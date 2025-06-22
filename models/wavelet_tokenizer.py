@@ -65,7 +65,18 @@ class WaveletTokenizer(nn.Module):
         self.itcwt = DTCWTInverse(biort="near_sym_b", qshift="qshift_b")
         self.vocab_size = vocab_size
         self.Cvae = 4  # quaternion dimension
-        self.quantize = self  # for compatibility with trainer
+        class _Proxy:
+            def __init__(self, parent: 'WaveletTokenizer'):
+                self._parent = parent
+                self.embedding = parent.embedding
+
+            def idxBl_to_var_input(self, gt_ms_idx_Bl):
+                return self._parent.idxBl_to_var_input(gt_ms_idx_Bl)
+
+            def get_next_autoregressive_input(self, si, SN, f_hat, h_BChw):
+                return self._parent.get_next_autoregressive_input(si, SN, f_hat, h_BChw)
+
+        self.quantize = _Proxy(self)  # lightweight proxy for trainer compatibility
         self.shapes: List[Tuple[int, int]] = []
 
     @staticmethod
@@ -100,7 +111,8 @@ class WaveletTokenizer(nn.Module):
         B, C, H, W = yl.shape
         self.shapes.append((C, H, W))
         low = torch.stack(
-            (yl, torch.zeros_like(yl), yl.abs(), torch.sign(yl)), dim=-1
+            (yl, torch.zeros_like(yl), torch.zeros_like(yl), torch.zeros_like(yl)),
+            dim=-1,
         )  # B C H W 4
         _, idx, _ = self.vq(low.permute(0, 2, 3, 1, 4).reshape(B, -1, 4))
         idx_ls.append(idx)
@@ -124,7 +136,7 @@ class WaveletTokenizer(nn.Module):
             .view(-1, H, W, C, 4)
             .permute(0, 3, 1, 2, 4)
         )
-        yl = self._quaternion_to_complex(q_low)[..., 0]
+        yl = q_low[..., 0]
         img = self.itcwt((yl, yh))
         return img.clamp(-1, 1)
 
