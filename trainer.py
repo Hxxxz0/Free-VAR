@@ -21,7 +21,7 @@ class VARTrainer(object):
     def __init__(
         self, device, patch_nums: Tuple[int, ...], resos: Tuple[int, ...],
         vae_local: VQVAE, var_wo_ddp: VAR, var: DDP,
-        var_opt: AmpOptimizer, label_smooth: float,
+        var_opt: AmpOptimizer, label_smooth: float, vq_loss_weight: float = 0.1,
     ):
         super(VARTrainer, self).__init__()
         
@@ -34,18 +34,35 @@ class VARTrainer(object):
         self.var_wo_ddp.rng = torch.Generator(device=device)
         
         self.label_smooth = label_smooth
+        self.vq_loss_weight = vq_loss_weight  # 可配置的VQ损失权重
         self.train_loss = nn.CrossEntropyLoss(label_smoothing=label_smooth, reduction='none')
         self.val_loss = nn.CrossEntropyLoss(label_smoothing=0.0, reduction='mean')
-        self.L = sum(pn * pn for pn in patch_nums)
-        self.last_l = patch_nums[-1] * patch_nums[-1]
-        self.loss_weight = torch.ones(1, self.L, device=device) / self.L
         
+        # 修复致命问题：正确处理小波VAR的实际token长度
+        if hasattr(var_wo_ddp, 'actual_token_lens') and var_wo_ddp.actual_token_lens is not None:
+            # 小波模式：使用实际的token长度
+            self.actual_token_lens = var_wo_ddp.actual_token_lens
+            self.L = sum(self.actual_token_lens)
+            self.last_l = self.actual_token_lens[-1]
+            self.begin_ends = var_wo_ddp.begin_ends.copy()  # 直接复制VAR模型中计算好的边界
+            print(f"[VARTrainer] 小波模式: 实际token长度 = {self.actual_token_lens}")
+            print(f"[VARTrainer] 总序列长度 L = {self.L}")
+            print(f"[VARTrainer] 层级边界 begin_ends = {self.begin_ends}")
+        else:
+            # 传统VQ-VAE模式：使用patch_nums的平方数
+            self.actual_token_lens = None
+            self.L = sum(pn * pn for pn in patch_nums)
+            self.last_l = patch_nums[-1] * patch_nums[-1]
+            self.begin_ends = []
+            cur = 0
+            for i, pn in enumerate(patch_nums):
+                self.begin_ends.append((cur, cur + pn * pn))
+                cur += pn*pn
+            print(f"[VARTrainer] 传统模式: patch_nums = {patch_nums}")
+            print(f"[VARTrainer] 总序列长度 L = {self.L}")
+        
+        self.loss_weight = torch.ones(1, self.L, device=device) / self.L
         self.patch_nums, self.resos = patch_nums, resos
-        self.begin_ends = []
-        cur = 0
-        for i, pn in enumerate(patch_nums):
-            self.begin_ends.append((cur, cur + pn * pn))
-            cur += pn*pn
         
         self.prog_it = 0
         self.last_prog_si = -1
@@ -63,16 +80,24 @@ class VARTrainer(object):
             inp_B3HW = inp_B3HW.to(dist.get_device(), non_blocking=True)
             label_B = label_B.to(dist.get_device(), non_blocking=True)
             
-            gt_idx_Bl, _ = self.vae_local.img_to_idxBl(inp_B3HW)
+            # 支持小波tokenizer的三元组返回，正确处理shapes和vq_loss
+            vae_output = self.vae_local.img_to_idxBl(inp_B3HW)
+            if len(vae_output) == 3:
+                gt_idx_Bl, shapes, eval_vq_loss = vae_output
+            else:
+                gt_idx_Bl, shapes = vae_output
+                eval_vq_loss = None
             gt_BL = torch.cat(gt_idx_Bl, dim=1)
             x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
             
             self.var_wo_ddp.forward
             logits_BLV = self.var_wo_ddp(label_B, x_BLCv_wo_first_l)
             L_mean += self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)) * B
-            L_tail += self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL[:, -self.last_l:].reshape(-1)) * B
+            # 修复：确保last_l不超过实际序列长度
+            actual_last_l = min(self.last_l, gt_BL.shape[1])
+            L_tail += self.val_loss(logits_BLV.data[:, -actual_last_l:].reshape(-1, V), gt_BL[:, -actual_last_l:].reshape(-1)) * B
             acc_mean += (logits_BLV.data.argmax(dim=-1) == gt_BL).sum() * (100/gt_BL.shape[1])
-            acc_tail += (logits_BLV.data[:, -self.last_l:].argmax(dim=-1) == gt_BL[:, -self.last_l:]).sum() * (100 / self.last_l)
+            acc_tail += (logits_BLV.data[:, -actual_last_l:].argmax(dim=-1) == gt_BL[:, -actual_last_l:]).sum() * (100 / actual_last_l)
             tot += B
         self.var_wo_ddp.train(training)
         
@@ -102,14 +127,15 @@ class VARTrainer(object):
         B, V = label_B.shape[0], self.vae_local.vocab_size
         self.var.require_backward_grad_sync = stepping
         
-        gt_idx_Bl, _ = self.vae_local.img_to_idxBl(inp_B3HW)
+        gt_idx_Bl, _, vq_loss = self.vae_local.img_to_idxBl(inp_B3HW)
         gt_BL = torch.cat(gt_idx_Bl, dim=1)
         x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
         
         with self.var_opt.amp_ctx:
             self.var_wo_ddp.forward
             logits_BLV = self.var(label_B, x_BLCv_wo_first_l)
-            loss = self.train_loss(logits_BLV.view(-1, V), gt_BL.view(-1)).view(B, -1)
+            ce_loss = self.train_loss(logits_BLV.view(-1, V), gt_BL.view(-1)).view(B, -1)
+                
             if prog_si >= 0:    # in progressive training
                 bg, ed = self.begin_ends[prog_si]
                 assert logits_BLV.shape[1] == gt_BL.shape[1] == ed
@@ -117,7 +143,11 @@ class VARTrainer(object):
                 lw[:, bg:ed] *= min(max(prog_wp, 0), 1)
             else:               # not in progressive training
                 lw = self.loss_weight
-            loss = loss.mul(lw).sum(dim=-1).mean()
+            loss = ce_loss.mul(lw).sum(dim=-1).mean()
+            
+            # 修复：添加VQ损失，权重可配置
+            if hasattr(self.vae_local, 'vq') and vq_loss is not None:
+                loss = loss + self.vq_loss_weight * vq_loss
         
         # backward
         grad_norm, scale_log2 = self.var_opt.backward_clip_step(loss=loss, stepping=stepping)
@@ -130,8 +160,10 @@ class VARTrainer(object):
             if prog_si >= 0:    # in progressive training
                 Ltail = acc_tail = -1
             else:               # not in progressive training
-                Ltail = self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL[:, -self.last_l:].reshape(-1)).item()
-                acc_tail = (pred_BL[:, -self.last_l:] == gt_BL[:, -self.last_l:]).float().mean().item() * 100
+                # 修复：确保last_l不超过实际序列长度
+                actual_last_l = min(self.last_l, gt_BL.shape[1])
+                Ltail = self.val_loss(logits_BLV.data[:, -actual_last_l:].reshape(-1, V), gt_BL[:, -actual_last_l:].reshape(-1)).item()
+                acc_tail = (pred_BL[:, -actual_last_l:] == gt_BL[:, -actual_last_l:]).float().mean().item() * 100
             grad_norm = grad_norm.item()
             metric_lg.update(Lm=Lmean, Lt=Ltail, Accm=acc_mean, Acct=acc_tail, tnm=grad_norm)
         
@@ -162,7 +194,8 @@ class VARTrainer(object):
     def get_config(self):
         return {
             'patch_nums':   self.patch_nums, 'resos': self.resos,
-            'label_smooth': self.label_smooth,
+            'label_smooth': self.label_smooth, 'vq_loss_weight': self.vq_loss_weight,
+            'actual_token_lens': self.actual_token_lens, 'L': self.L, 'begin_ends': self.begin_ends,
             'prog_it':      self.prog_it, 'last_prog_si': self.last_prog_si, 'first_prog': self.first_prog,
         }
     

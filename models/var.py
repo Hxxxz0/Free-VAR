@@ -4,6 +4,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from huggingface_hub import PyTorchModelHubMixin
 
 import dist
@@ -38,17 +39,87 @@ class VAR(nn.Module):
         self.cond_drop_rate = cond_drop_rate
         self.prog_si = -1   # progressive training
         
-        if use_wavelet and wavelet_patch_nums is not None:
-            patch_nums = tuple(wavelet_patch_nums)
-            vae_local.patch_nums = patch_nums
-        self.patch_nums: Tuple[int] = patch_nums
-        self.L = sum(pn ** 2 for pn in self.patch_nums)
-        self.first_l = self.patch_nums[0] ** 2
+        # 修改：根据是否使用wavelet来计算实际的token长度
+        if use_wavelet and hasattr(vae_local, 'img_to_idxBl'):
+            # 使用wavelet的实际token长度
+            img_size = 256  # 使用训练时的图像尺寸
+            try:
+                # 确保在正确的设备上
+                device = next(vae_local.parameters()).device
+                dummy_img = torch.randn(1, 3, img_size, img_size, device=device)
+                
+                # 设置评估模式避免统计更新，使用虚拟输入计算token长度
+                was_training = vae_local.training
+                vae_local.eval()
+                
+                with torch.no_grad():
+                    vae_output = vae_local.img_to_idxBl(dummy_img)
+                    if len(vae_output) == 3:
+                        idx_list, _, _ = vae_output
+                    else:
+                        idx_list, _ = vae_output
+
+                # 恢复原始训练状态
+                vae_local.train(was_training)
+                
+                actual_token_lens = [idx.shape[1] for idx in idx_list]
+                
+                # 重新定义patch_nums为实际的token数量（开方取整，用于兼容原有逻辑）
+                self.patch_nums = tuple(int(tl**0.5) if tl > 0 else 1 for tl in actual_token_lens)
+                self.actual_token_lens = actual_token_lens
+                self.L = sum(actual_token_lens)
+                self.first_l = actual_token_lens[0]
+                
+                print(f"[VAR] Wavelet模式: 实际token长度 = {actual_token_lens}")
+                print(f"[VAR] 总序列长度 L = {self.L}")
+                print(f"[VAR] 等效patch_nums = {self.patch_nums}")
+                
+            except Exception as e:
+                print(f"[VAR] Warning: 无法计算wavelet token长度，使用默认值: {e}")
+                # 回退到默认配置
+                if wavelet_patch_nums is not None:
+                    # 使用预设的patch_nums估算token长度
+                    estimated_token_lens = [pn * pn for pn in wavelet_patch_nums]
+                    self.patch_nums = tuple(wavelet_patch_nums)
+                    self.actual_token_lens = estimated_token_lens
+                    self.L = sum(estimated_token_lens)
+                    self.first_l = estimated_token_lens[0]
+                    
+                    # 设置小波tokenizer的patch_nums以保持一致
+                    if hasattr(vae_local, 'patch_nums'):
+                        vae_local.patch_nums = self.patch_nums
+                    
+                    print(f"[VAR] 使用预设的小波配置: patch_nums={self.patch_nums}")
+                    print(f"[VAR] 估算token长度 = {estimated_token_lens}")
+                else:
+                    # 完全回退到传统模式
+                    self.patch_nums = patch_nums
+                    self.L = sum(pn ** 2 for pn in self.patch_nums)
+                    self.first_l = self.patch_nums[0] ** 2
+                    self.actual_token_lens = None
+                    print(f"[VAR] 回退到传统VQVAE模式")
+        else:
+            # 原版VQVAE模式
+            if use_wavelet and wavelet_patch_nums is not None:
+                patch_nums = tuple(wavelet_patch_nums)
+                vae_local.patch_nums = patch_nums
+            self.patch_nums = patch_nums
+            self.L = sum(pn ** 2 for pn in self.patch_nums)
+            self.first_l = self.patch_nums[0] ** 2
+            self.actual_token_lens = None
+            
         self.begin_ends = []
         cur = 0
-        for i, pn in enumerate(self.patch_nums):
-            self.begin_ends.append((cur, cur+pn ** 2))
-            cur += pn ** 2
+        if self.actual_token_lens is not None:
+            # 使用实际token长度
+            for i, token_len in enumerate(self.actual_token_lens):
+                self.begin_ends.append((cur, cur + token_len))
+                cur += token_len
+        else:
+            # 使用patch_nums
+            for i, pn in enumerate(self.patch_nums):
+                self.begin_ends.append((cur, cur + pn ** 2))
+                cur += pn ** 2
         
         self.num_stages_minus_1 = len(self.patch_nums) - 1
         self.rng = torch.Generator(device=dist.get_device())
@@ -71,10 +142,18 @@ class VAR(nn.Module):
         
         # 3. absolute position embedding
         pos_1LC = []
-        for i, pn in enumerate(self.patch_nums):
-            pe = torch.empty(1, pn*pn, self.C)
-            nn.init.trunc_normal_(pe, mean=0, std=init_std)
-            pos_1LC.append(pe)
+        if self.actual_token_lens is not None:
+            # 使用实际token长度
+            for i, token_len in enumerate(self.actual_token_lens):
+                pe = torch.empty(1, token_len, self.C)
+                nn.init.trunc_normal_(pe, mean=0, std=init_std)
+                pos_1LC.append(pe)
+        else:
+            # 使用patch_nums
+            for i, pn in enumerate(self.patch_nums):
+                pe = torch.empty(1, pn*pn, self.C)
+                nn.init.trunc_normal_(pe, mean=0, std=init_std)
+                pos_1LC.append(pe)
         pos_1LC = torch.cat(pos_1LC, dim=1)     # 1, L, C
         assert tuple(pos_1LC.shape) == (1, self.L, self.C)
         self.pos_1LC = nn.Parameter(pos_1LC)
@@ -110,7 +189,15 @@ class VAR(nn.Module):
         
         # 5. attention mask used in training (for masking out the future)
         #    it won't be used in inference, since kv cache is enabled
-        d: torch.Tensor = torch.cat([torch.full((pn*pn,), i) for i, pn in enumerate(self.patch_nums)]).view(1, self.L, 1)
+        if self.actual_token_lens is not None:
+            # 使用实际token长度创建level标识
+            d_parts = []
+            for i, token_len in enumerate(self.actual_token_lens):
+                d_parts.append(torch.full((token_len,), i))
+            d = torch.cat(d_parts).view(1, self.L, 1)
+        else:
+            # 使用patch_nums
+            d = torch.cat([torch.full((pn*pn,), i) for i, pn in enumerate(self.patch_nums)]).view(1, self.L, 1)
         dT = d.transpose(1, 2)    # dT: 11L
         lvl_1L = dT[:, 0].contiguous()
         self.register_buffer('lvl_1L', lvl_1L)
@@ -204,7 +291,11 @@ class VAR(nn.Module):
             if not hasattr(self, '_wavelet_shapes'):
                 img_size = self.patch_nums[-1] * 16
                 dummy = torch.zeros(1, 3, img_size, img_size, device=self.lvl_1L.device)
-                _, self._wavelet_shapes = self.vae_proxy[0].img_to_idxBl(dummy)
+                vae_output = self.vae_proxy[0].img_to_idxBl(dummy)
+                if len(vae_output) == 3:
+                    _, self._wavelet_shapes, _ = vae_output
+                else:
+                    _, self._wavelet_shapes = vae_output
             return self.vae_proxy[0].idxBl_to_img(ms_idx, self._wavelet_shapes).add_(1).mul_(0.5)
     
     def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV

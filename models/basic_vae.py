@@ -15,26 +15,43 @@ def nonlinearity(x):
     return x * torch.sigmoid(x)
 
 
-def Normalize(in_channels, num_groups=32):
-    return torch.nn.GroupNorm(num_groups=num_groups, num_channels=in_channels, eps=1e-6, affine=True)
+def _select_group_num(in_channels: int, preferred_groups: int = 32) -> int:
+    """选择能够整除通道数且<=preferred_groups的最佳 GroupNorm 组数。
+
+    逻辑：从 preferred_groups 开始，若不能整除则依次折半直到找到能整除的数；
+    最坏情况下返回 1（等价于 LayerNorm）。"""
+    g = min(preferred_groups, in_channels)
+    while in_channels % g != 0 and g > 1:
+        g //= 2
+    return max(g, 1)
+
+
+def Normalize(in_channels: int, num_groups: int = 32):
+    """比原版更健壮的 GroupNorm：在通道数很小时也能工作。"""
+    g = _select_group_num(in_channels, num_groups)
+    return torch.nn.GroupNorm(num_groups=g, num_channels=in_channels, eps=1e-6, affine=True)
 
 
 class Upsample2x(nn.Module):
+    """2× 上采样：先使用双线性插值再卷积，有效减轻棋盘伪影。"""
     def __init__(self, in_channels):
         super().__init__()
         self.conv = torch.nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
     
     def forward(self, x):
-        return self.conv(F.interpolate(x, scale_factor=2, mode='nearest'))
+        # bilinear 插值更平滑；align_corners=False 可避免异常放大
+        return self.conv(F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False))
 
 
 class Downsample2x(nn.Module):
+    """2× 下采样：反射填充 + stride=2 卷积，减轻边界伪影。"""
     def __init__(self, in_channels):
         super().__init__()
         self.conv = torch.nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
     
     def forward(self, x):
-        return self.conv(F.pad(x, pad=(0, 1, 0, 1), mode='constant', value=0))
+        # 反射填充在重建类任务中相比零填充具有更好的边缘连续性
+        return self.conv(F.pad(x, pad=(0, 1, 0, 1), mode='reflect'))
 
 
 class ResnetBlock(nn.Module):
@@ -224,3 +241,26 @@ class Decoder(nn.Module):
         # end
         h = self.conv_out(F.silu(self.norm_out(h), inplace=True))
         return h
+
+
+# -----------------------  Weight Initialization  -----------------------
+# 使用 Kaiming-Normal 初始化卷积权重，保证在深层网络中信号方差稳定。
+
+def _init_weights(m):
+    if isinstance(m, nn.Conv2d):
+        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.GroupNorm):
+        nn.init.ones_(m.weight)
+        nn.init.zeros_(m.bias)
+
+
+# 在文件加载时立即给现有模块注册初始化器
+for _cls in ['Encoder', 'Decoder', 'ResnetBlock', 'AttnBlock', 'Upsample2x', 'Downsample2x']:
+    if _cls in globals():
+        globals()[_cls].__init__.__globals__['_init_weights'] = _init_weights  # 注入到各类的全局命名空间
+
+# 对 Encoder 与 Decoder 顶层应用初始化
+Encoder.__init__.__post_init__ = lambda self, *args, **kwargs: self.apply(_init_weights)
+Decoder.__init__.__post_init__ = lambda self, *args, **kwargs: self.apply(_init_weights)

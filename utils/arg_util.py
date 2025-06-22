@@ -64,12 +64,15 @@ class Args(Tap):
     anorm: bool = True      # whether to use L2 normalized attention
     fuse: bool = True       # whether to use fused op like flash attn, xformers, fused MLP, fused LayerNorm, etc.
 
-    # wavelet tokenizer
+    # wavelet tokenizer - 改进默认参数设置
     wavelet: bool = False   # enable wavelet tokenizer
     wlevels: int = 3        # number of wavelet decomposition levels
     wvocab: int = 4096      # wavelet codebook size
     wpatch: str = ''        # wavelet patch nums, e.g. '64_16_4'
     wavelet_patch_nums: tuple = None  # [automatically set]
+    wznorm: bool = False    # use cosine distance for wavelet quantization
+    wbeta: float = 0.25     # commitment loss weight for wavelet quantizer - 调整权重平衡
+    vq_loss_weight: float = 0.1  # VQ loss weight in total training loss (only for wavelet mode)
     
     # data
     pn: str = '1_2_3_4_5_6_8_10_13_16'
@@ -210,6 +213,104 @@ class Args(Tap):
         s = '\n'.join(s)
         return f'{{\n{s}\n}}\n'
 
+    def configure(self):
+        # VAR
+        if self.ini < 0:
+            self.ini = 1 / self.depth ** 0.5
+        if self.tlr is None:
+            self.tlr = self.tblr * self.bs / 256
+        if self.twde <= 0:
+            self.twde = self.twd
+        if self.saln:
+            self.pn = self.pn.replace('-', '_')
+        
+        # 修复：正确解析小波patch_nums参数
+        if self.wpatch:
+            try:
+                # 支持多种分隔符：逗号、下划线、空格
+                wpatch_str = self.wpatch.replace(',', '_').replace(' ', '_')
+                self.wavelet_patch_nums = tuple(map(int, wpatch_str.split('_')))
+                # 成功解析，静默处理
+                pass
+            except (ValueError, TypeError) as e:
+                print(f"[Args] Warning: 无法解析--wpatch参数 '{self.wpatch}': {e}")
+                self.wavelet_patch_nums = None
+        else:
+            self.wavelet_patch_nums = None
+        
+        # patch_nums
+        self.patch_nums = tuple(map(int, self.pn.replace('-', '_').split('_')))
+        self.resos = tuple(pn * self.patch_size for pn in self.patch_nums)
+        
+        # 修复：确保小波模式下patch_nums和wavelet_patch_nums的一致性
+        if self.wavelet and self.wavelet_patch_nums is not None:
+            if len(self.wavelet_patch_nums) != self.wlevels + 1:
+                print(f"[Args] Error: wavelet_patch_nums长度({len(self.wavelet_patch_nums)}) != wlevels+1({self.wlevels+1})")
+                print(f"[Args] 将自动调整wavelet_patch_nums")
+                # 自动生成合适的patch_nums
+                if len(self.wavelet_patch_nums) == 1:
+                    # 如果只提供一个值，自动生成递减序列
+                    base = self.wavelet_patch_nums[0]
+                    self.wavelet_patch_nums = tuple(max(1, base // (2**i)) for i in range(self.wlevels + 1))
+                else:
+                    # 截断或填充到正确长度
+                    if len(self.wavelet_patch_nums) > self.wlevels + 1:
+                        self.wavelet_patch_nums = self.wavelet_patch_nums[:self.wlevels + 1]
+                    else:
+                        # 用最后一个值填充
+                        last_val = self.wavelet_patch_nums[-1]
+                        self.wavelet_patch_nums = tuple(list(self.wavelet_patch_nums) + [last_val] * (self.wlevels + 1 - len(self.wavelet_patch_nums)))
+                print(f"[Args] 调整后的wavelet_patch_nums: {self.wavelet_patch_nums}")
+        
+        # data_load_reso
+        if self.data_load_reso is None:
+            self.data_load_reso = max(self.patch_nums) * self.patch_size
+        
+        # batch_size
+        if self.batch_size == 0:
+            self.batch_size = round(self.bs / self.ac / dist.get_world_size() / 8) * 8
+        self.glb_batch_size = self.batch_size * dist.get_world_size() * self.ac
+        
+        # device
+        self.device = dist.get_device()
+        
+        # seed
+        if self.seed is None:
+            if self.local_debug:
+                self.seed = 0
+            else:
+                self.seed = hash(self.branch + self.commit_id + self.cmd) % 1000000
+        
+        # directories
+        self.exp_dir = os.path.join(self.local_out_dir_path, self.exp_name)
+        os.makedirs(self.exp_dir, exist_ok=True)
+        self.tb_log_dir_path = os.path.join(self.exp_dir, 'tb-log')
+        self.log_txt_path = os.path.join(self.exp_dir, 'log.txt')
+        self.last_ckpt_path = os.path.join(self.exp_dir, 'ar-ckpt-last.pth')
+        
+        # extra args
+        self.extra_args = self.get_extra_args()
+        if self.extra_args:
+            print(f'=========================== WARNING: UNEXPECTED EXTRA ARGS ===========================\n{self.extra_args}')
+            print(f'=========================== WARNING: UNEXPECTED EXTRA ARGS ===========================')
+        
+        # set tf32
+        self.set_tf32(self.tf32)
+        
+        # log summary
+        print(f"[Args] 配置完成:")
+        print(f"  - 小波模式: {self.wavelet}")
+        if self.wavelet:
+            print(f"  - 小波层数: {self.wlevels}")
+            print(f"  - 小波词汇表大小: {self.wvocab}")
+            print(f"  - 小波patch_nums: {self.wavelet_patch_nums}")
+        print(f"  - 标准patch_nums: {self.patch_nums}")
+        print(f"  - 数据加载分辨率: {self.data_load_reso}")
+        print(f"  - 批量大小: {self.batch_size} (全局: {self.glb_batch_size})")
+
+    def get_extra_args(self):
+        return self.extra_args if hasattr(self, 'extra_args') else []
+
 
 def init_dist_and_get_args():
     for i in range(len(sys.argv)):
@@ -259,6 +360,18 @@ def init_dist_and_get_args():
     args.data_load_reso = max(args.resos)
     if args.wavelet and not args.wpatch:
         final_pn = args.patch_nums[-1]
+        # 确保最终分辨率满足 DTCWT 约束：(final_pn * 16) % (2^levels) == 0
+        img_downsample = 16
+        required_divisor = 2 ** args.wlevels
+        final_reso = final_pn * img_downsample
+        
+        if final_reso % required_divisor != 0:
+            # 调整到最近的满足约束的值
+            adjusted_final_pn = ((final_reso + required_divisor - 1) // required_divisor) * required_divisor // img_downsample
+            print(f'[args] Adjusting final patch_num from {final_pn} to {adjusted_final_pn} to satisfy DTCWT constraint')
+            final_pn = adjusted_final_pn
+        
+        # 生成从粗到细的patch数量序列
         args.wavelet_patch_nums = tuple(
             max(1, final_pn // (2 ** i)) for i in range(args.wlevels, -1, -1)
         )

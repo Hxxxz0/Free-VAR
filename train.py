@@ -83,10 +83,19 @@ def build_everything(args: arg_util.Args):
     from utils.lr_control import filter_params
     
     if args.wavelet:
-        vae_local = WaveletTokenizer(levels=args.wlevels, vocab_size=args.wvocab, patch_nums=args.wavelet_patch_nums)
+        vae_local = WaveletTokenizer(
+            levels=args.wlevels, 
+            vocab_size=args.wvocab, 
+            patch_nums=args.wavelet_patch_nums,
+            using_znorm=args.wznorm,
+            beta=args.wbeta,
+            embed_dim=64,
+            verbose=True
+        )
+        var_embed_dim = args.depth * 48
         var_wo_ddp = VAR(
             vae_local=vae_local,
-            num_classes=num_classes, depth=args.depth, embed_dim=args.depth * 64,
+            num_classes=num_classes, depth=args.depth, embed_dim=var_embed_dim,
             num_heads=args.depth, mlp_ratio=4., drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1 * args.depth / 24,
             norm_eps=1e-6, shared_aln=args.saln, cond_drop_rate=0.1,
             attn_l2_norm=args.anorm, patch_nums=args.patch_nums,
@@ -131,6 +140,19 @@ def build_everything(args: arg_util.Args):
         'ada_gss', 'moe_bias',
         'scale_mul',
     })
+
+    # === add wavelet-tokenizer params (learning rate×0.1, no weight-decay) ===
+    if args.wavelet:
+        tk_names, tk_paras, tk_groups = filter_params(vae_local, nowd_keys={'running_mu', 'running_std'})
+        # scale lr & wd for tokenizer
+        for g in tk_groups:
+            g.setdefault('lr_sc', 1.0)
+            g['lr_sc'] *= 0.1   # 10× smaller lr
+            g['wd_sc'] = 0.0    # no weight decay for statistics/embedding
+        names += tk_names
+        paras += tk_paras
+        para_groups += tk_groups
+
     opt_clz = {
         'adam':  partial(torch.optim.AdamW, betas=(0.9, 0.95), fused=args.afuse),
         'adamw': partial(torch.optim.AdamW, betas=(0.9, 0.95), fused=args.afuse),
@@ -148,7 +170,7 @@ def build_everything(args: arg_util.Args):
     trainer = VARTrainer(
         device=args.device, patch_nums=args.patch_nums, resos=args.resos,
         vae_local=vae_local, var_wo_ddp=var_wo_ddp, var=var,
-        var_opt=var_optim, label_smooth=args.ls,
+        var_opt=var_optim, label_smooth=args.ls, vq_loss_weight=args.vq_loss_weight,
     )
     if trainer_state is not None and len(trainer_state):
         trainer.load_state_dict(trainer_state, strict=False, skip_vae=True) # don't load vae again
