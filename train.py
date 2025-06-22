@@ -77,33 +77,50 @@ def build_everything(args: arg_util.Args):
     
     # build models
     from torch.nn.parallel import DistributedDataParallel as DDP
-    from models import VAR, VQVAE, build_vae_var
+    from models import VAR, VQVAE, WaveletTokenizer, build_vae_var
     from trainer import VARTrainer
     from utils.amp_sc import AmpOptimizer
     from utils.lr_control import filter_params
     
-    vae_local, var_wo_ddp = build_vae_var(
-        V=4096, Cvae=32, ch=160, share_quant_resi=4,        # hard-coded VQVAE hyperparameters
-        device=dist.get_device(), patch_nums=args.patch_nums,
-        num_classes=num_classes, depth=args.depth, shared_aln=args.saln, attn_l2_norm=args.anorm,
-        flash_if_available=args.fuse, fused_if_available=args.fuse,
-        init_adaln=args.aln, init_adaln_gamma=args.alng, init_head=args.hd, init_std=args.ini,
-    )
-    
-    vae_ckpt = 'vae_ch160v4096z32.pth'
-    if dist.is_local_master():
-        if not os.path.exists(vae_ckpt):
-            os.system(f'wget https://huggingface.co/FoundationVision/var/resolve/main/{vae_ckpt}')
-    dist.barrier()
-    vae_local.load_state_dict(torch.load(vae_ckpt, map_location='cpu'), strict=True)
-    
-    vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
-    var_wo_ddp: VAR = args.compile_model(var_wo_ddp, args.tfast)
+    if args.wavelet:
+        vae_local = WaveletTokenizer(levels=args.wlevels, vocab_size=args.wvocab)
+        var_wo_ddp = VAR(
+            vae_local=vae_local,
+            num_classes=num_classes, depth=args.depth, embed_dim=args.depth * 64,
+            num_heads=args.depth, mlp_ratio=4., drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1 * args.depth / 24,
+            norm_eps=1e-6, shared_aln=args.saln, cond_drop_rate=0.1,
+            attn_l2_norm=args.anorm, patch_nums=args.patch_nums,
+            flash_if_available=args.fuse, fused_if_available=args.fuse,
+            use_wavelet=True, wavelet_levels=args.wlevels, wavelet_vocab=args.wvocab,
+        )
+        vae_local = args.compile_model(vae_local, args.vfast)
+        var_wo_ddp = args.compile_model(var_wo_ddp, args.tfast)
+    else:
+        vae_local, var_wo_ddp = build_vae_var(
+            V=4096, Cvae=32, ch=160, share_quant_resi=4,
+            device=dist.get_device(), patch_nums=args.patch_nums,
+            num_classes=num_classes, depth=args.depth, shared_aln=args.saln, attn_l2_norm=args.anorm,
+            flash_if_available=args.fuse, fused_if_available=args.fuse,
+            init_adaln=args.aln, init_adaln_gamma=args.alng, init_head=args.hd, init_std=args.ini,
+        )
+
+        vae_ckpt = 'vae_ch160v4096z32.pth'
+        if dist.is_local_master():
+            if not os.path.exists(vae_ckpt):
+                os.system(f'wget https://huggingface.co/FoundationVision/var/resolve/main/{vae_ckpt}')
+        dist.barrier()
+        vae_local.load_state_dict(torch.load(vae_ckpt, map_location='cpu'), strict=True)
+
+        vae_local = args.compile_model(vae_local, args.vfast)
+        var_wo_ddp = args.compile_model(var_wo_ddp, args.tfast)
     var: DDP = (DDP if dist.initialized() else NullDDP)(var_wo_ddp, device_ids=[dist.get_local_rank()], find_unused_parameters=False, broadcast_buffers=False)
     
     print(f'[INIT] VAR model = {var_wo_ddp}\n\n')
     count_p = lambda m: f'{sum(p.numel() for p in m.parameters())/1e6:.2f}'
-    print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('VAE', vae_local), ('VAE.enc', vae_local.encoder), ('VAE.dec', vae_local.decoder), ('VAE.quant', vae_local.quantize))]))
+    if args.wavelet:
+        print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('Tokenizer', vae_local),)]))
+    else:
+        print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('VAE', vae_local), ('VAE.enc', vae_local.encoder), ('VAE.dec', vae_local.decoder), ('VAE.quant', vae_local.quantize))]))
     print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('VAR', var_wo_ddp),)]) + '\n\n')
     
     # build optimizer
