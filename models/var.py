@@ -204,8 +204,8 @@ class VAR(nn.Module):
             if not hasattr(self, '_wavelet_shapes'):
                 img_size = self.patch_nums[-1] * 16
                 dummy = torch.zeros(1, 3, img_size, img_size, device=self.lvl_1L.device)
-                _, self._wavelet_shapes = self.vae_proxy[0].img_to_idxBl(dummy)
-            return self.vae_proxy[0].idxBl_to_img(ms_idx, self._wavelet_shapes).add_(1).mul_(0.5)
+                _, self._wavelet_shapes, self._wavelet_stats = self.vae_proxy[0].img_to_idxBl(dummy)
+            return self.vae_proxy[0].idxBl_to_img(ms_idx, self._wavelet_shapes, getattr(self, '_wavelet_stats', None)).add_(1).mul_(0.5)
     
     def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
         """
