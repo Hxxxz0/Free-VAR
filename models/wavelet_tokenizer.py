@@ -1,5 +1,5 @@
 import math
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -57,7 +57,7 @@ class EMAVQ(nn.Module):
 class WaveletTokenizer(nn.Module):
     """Multi-scale wavelet tokenizer using amplitude/cos/sin VQ."""
 
-    def __init__(self, levels: int = 3, vocab_size: int = 4096):
+    def __init__(self, levels: int = 3, vocab_size: int = 4096, learn_scaling: bool = False):
         super().__init__()
         self.levels = levels
         self.vq = EMAVQ(vocab_size, 3)   # amp + cosφ + sinφ
@@ -66,6 +66,14 @@ class WaveletTokenizer(nn.Module):
         self.itcwt = DTCWTInverse(biort="near_sym_b", qshift="qshift_b")
         self.vocab_size = vocab_size
         self.Cvae = 3  # amp, cosφ, sinφ
+        self.learn_scaling = learn_scaling
+        scale = torch.ones(levels + 1)
+        if learn_scaling:
+            self.level_scale = nn.Parameter(scale)
+            self._scale_initialized = False
+        else:
+            self.register_buffer('level_scale', scale)
+            self._scale_initialized = True
         class _Proxy:
             def __init__(self, parent: 'WaveletTokenizer'):
                 self._parent = parent
@@ -101,49 +109,91 @@ class WaveletTokenizer(nn.Module):
         imag = amp * sin
         return torch.stack((real, imag), dim=-1)
 
-    def img_to_idxBl(self, img: torch.Tensor) -> Tuple[List[torch.Tensor], List[Tuple[int, int, int, int]]]:
-        """Decompose image and quantize to token indices."""
+    def img_to_idxBl(self, img: torch.Tensor) -> Tuple[List[torch.Tensor], List[Tuple[int, int, int, int]], List[Tuple[torch.Tensor, torch.Tensor]]]:
+        """Decompose image and quantize to token indices.
+
+        Returns:
+            idx_ls: list of token indices for each level
+            shapes_local: shapes for each level
+            amp_stats: list of (mean, std) tuples for amplitude at each level
+        """
         yl, yh = self.dtcwt(img)
         shapes_local: List[Tuple[int, int, int, int]] = []
         idx_ls: List[torch.Tensor] = []
-        for h in yh:
+        amp_stats: List[Tuple[torch.Tensor, torch.Tensor]] = []
+
+        for li, h in enumerate(yh):
             B, C, O, H, W, _ = h.shape
             shapes_local.append((C, O, H, W))
+            real, imag = h.unbind(-1)
+            amp = torch.sqrt(real ** 2 + imag ** 2)
+            mean = amp.mean(dim=(1, 2, 3, 4))
+            std = amp.std(dim=(1, 2, 3, 4)) + 1e-8
+            if self.learn_scaling and not self._scale_initialized:
+                self.level_scale.data[li] = (1.0 / std.mean()).detach()
+            amp_n = (amp - mean[:, None, None, None, None]) / std[:, None, None, None, None]
+            amp_n = amp_n * self.level_scale[li]
+            cos = real / (amp + 1e-8)
+            sin = imag / (amp + 1e-8)
             q = (
-                self._complex_to_acs(h)
+                torch.stack((amp_n, cos, sin), dim=-1)
                 .permute(0, 3, 4, 2, 1, 5)  # B H W O C 3
                 .reshape(B, -1, 3)
             )
             _, idx, _ = self.vq(q)
             idx_ls.append(idx)
+            amp_stats.append((mean, std))
+
         B, C, H, W = yl.shape
         shapes_local.append((C, 1, H, W))
-        low_c = torch.stack((yl, torch.zeros_like(yl)), dim=-1)
-        low = self._complex_to_acs(low_c).unsqueeze(2)
-        _, idx, _ = self.vq(low.permute(0, 3, 4, 2, 1, 5).reshape(B, -1, 3))
+        amp = yl.abs()
+        mean = amp.mean(dim=(1, 2, 3))
+        std = amp.std(dim=(1, 2, 3)) + 1e-8
+        if self.learn_scaling and not self._scale_initialized:
+            self.level_scale.data[-1] = (1.0 / std.mean()).detach()
+            self._scale_initialized = True
+        amp_n = (amp - mean[:, None, None, None]) / std[:, None, None, None]
+        amp_n = amp_n * self.level_scale[-1]
+        cos = yl / (amp + 1e-8)
+        sin = torch.zeros_like(yl)
+        q = torch.stack((amp_n, cos, sin), dim=-1).unsqueeze(2)
+        _, idx, _ = self.vq(q.permute(0, 3, 4, 2, 1, 5).reshape(B, -1, 3))
         idx_ls.append(idx)
-        return idx_ls, shapes_local
+        amp_stats.append((mean, std))
 
-    def idxBl_to_img(self, ms_idx_Bl: List[torch.Tensor], shapes) -> torch.Tensor:
-        """Decode tokens back to image."""
+        return idx_ls, shapes_local, amp_stats
+
+    def idxBl_to_img(self, ms_idx_Bl: List[torch.Tensor], shapes, amp_stats: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None) -> torch.Tensor:
+        """Decode tokens back to image using stored amplitude statistics."""
+        if amp_stats is None:
+            amp_stats = [(torch.zeros(1, device=self.level_scale.device), torch.ones(1, device=self.level_scale.device))] * (self.levels + 1)
+
         yh = []
         for i, idx in enumerate(ms_idx_Bl[:-1]):
             C, O, H, W = shapes[i]
+            mean, std = amp_stats[i]
             B = idx.shape[0]
             ap = (
                 self.embedding(idx)
                 .reshape(B, H, W, O, C, 3)
                 .permute(0, 4, 3, 1, 2, 5)
         )
+            amp = ap[..., 0] / self.level_scale[i]
+            amp = amp * std[:, None, None, None, None] + mean[:, None, None, None, None]
+            ap = torch.stack((amp, ap[..., 1], ap[..., 2]), dim=-1)
             c = self._acs_to_complex(ap)
             yh.append(c)
         C, _, H, W = shapes[-1]
+        mean, std = amp_stats[-1]
         B = ms_idx_Bl[-1].shape[0]
         ap_low = (
             self.embedding(ms_idx_Bl[-1])
             .reshape(B, H, W, 1, C, 3)
             .permute(0, 4, 3, 1, 2, 5)
         )
+        amp = ap_low[..., 0] / self.level_scale[-1]
+        amp = amp * std[:, None, None, None] + mean[:, None, None, None]
+        ap_low = torch.stack((amp, ap_low[..., 1], ap_low[..., 2]), dim=-1)
         yl = self._acs_to_complex(ap_low)[..., 0]
         yl = yl.squeeze(2)
         img = self.itcwt((yl, yh))
