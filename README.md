@@ -100,7 +100,8 @@ You can load these models to generate images via the codes in [demo_sample.ipynb
 
 1. Install `torch>=2.0.0`.
 2. Install other pip packages via `pip3 install -r requirements.txt`.
-3. Prepare the [ImageNet](http://image-net.org/) dataset
+3. To enable the wavelet tokenizer, install `pytorch_wavelets` by running `pip3 install pytorch_wavelets`.
+4. Prepare the [ImageNet](http://image-net.org/) dataset
     <details>
     <summary> assume the ImageNet is in `/path/to/imagenet`. It should be like this:</summary>
 
@@ -126,6 +127,8 @@ You can load these models to generate images via the codes in [demo_sample.ipynb
 ## Training Scripts
 
 To train VAR-{d16, d20, d24, d30, d36-s} on ImageNet 256x256 or 512x512, you can run the following command:
+Add `--wavelet` to enable the wavelet tokenizer. Use `--wlevels` and `--wvocab` to adjust decomposition levels and codebook size.
+When enabled, images are tokenized via multi-scale wavelet coefficients instead of the default VQ-VAE encoder, which may lead to different training dynamics and sampling behavior.
 ```shell
 # d16, 256x256
 torchrun --nproc_per_node=8 --nnodes=... --node_rank=... --master_addr=... --master_port=... train.py \
