@@ -123,6 +123,12 @@ You can load these models to generate images via the codes in [demo_sample.ipynb
 
 5. (Optional) install and compile `flash-attn` and `xformers` for faster attention computation. Our code will automatically use them if installed. See [models/basic_var.py#L15-L30](models/basic_var.py#L15-L30).
 
+## Wavelet Tokenizer
+
+The optional tokenizer replaces the VQ-VAE encoder with a dual-tree complex wavelet transform (DTCWT). Images are decomposed into multiple levels of complex coefficients. For each level we convert the complex values to amplitude, cosine and sine features, normalize them with running statistics and then vector-quantize them with an EMA codebook. During decoding the stored statistics restore the amplitudes and an inverse DTCWT synthesizes the final image.
+
+You can control the decomposition depth with `--wlevels` and the vocabulary size with `--wvocab`. Patch counts for each level are given via `--wpatch` so tokens match the transformer input resolution.
+
 
 ## Training Scripts
 
