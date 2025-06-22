@@ -129,6 +129,7 @@ You can load these models to generate images via the codes in [demo_sample.ipynb
 To train VAR-{d16, d20, d24, d30, d36-s} on ImageNet 256x256 or 512x512, you can run the following command:
 Add `--wavelet` to enable the DTCWT-based tokenizer. Use `--wlevels` and `--wvocab` to adjust decomposition levels and codebook size.
 When enabled, images are tokenized with multi-scale wavelet coefficients in place of the VQ-VAE encoder, leading to slightly different training dynamics and sampling behavior.
+If wavelet mode is used, specify patch counts for each level with `--wpatch`.  The number of values should be `wlevels + 1`.  For example, `--wpatch=2_4_8_16` works for `--wlevels=3`.  When omitted, the values are derived automatically from the final resolution.
 ```shell
 # d16, 256x256
 torchrun --nproc_per_node=8 --nnodes=... --node_rank=... --master_addr=... --master_port=... train.py \

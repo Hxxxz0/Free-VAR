@@ -257,7 +257,13 @@ def init_dist_and_get_args():
     args.patch_nums = tuple(map(int, args.pn.replace('-', '_').split('_')))
     args.resos = tuple(pn * args.patch_size for pn in args.patch_nums)
     args.data_load_reso = max(args.resos)
-    if args.wpatch:
+    if args.wavelet and not args.wpatch:
+        final_pn = args.patch_nums[-1]
+        args.wavelet_patch_nums = tuple(
+            max(1, final_pn // (2 ** i)) for i in range(args.wlevels, -1, -1)
+        )
+        print(f'[args] wpatch not provided; using {args.wavelet_patch_nums}')
+    elif args.wpatch:
         args.wavelet_patch_nums = tuple(map(int, args.wpatch.replace('-', '_').split('_')))
     
     # update args: bs and lr
