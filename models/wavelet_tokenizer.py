@@ -46,9 +46,10 @@ class EMAVQ(nn.Module):
             n = self.ema_cluster_size.sum()
             cluster_size = (self.ema_cluster_size + self.eps) / (n + self.vocab_size * self.eps) * n
             embed = self.ema_weight / cluster_size.unsqueeze(1)
-            self.embedding.weight.data.copy_(embed)
+            with torch.no_grad():
+                self.embedding.weight.copy_(embed)
 
-        loss = F.mse_loss(quant.detach(), feats)
+        loss = F.mse_loss(quant, feats.detach()) + 0.25 * F.mse_loss(feats, quant.detach())
         quant = feats + (quant - feats).detach()
         return quant, idx.view(B, L), loss
 
@@ -76,8 +77,11 @@ class WaveletTokenizer(nn.Module):
             def get_next_autoregressive_input(self, si, SN, f_hat, h_BChw):
                 return self._parent.get_next_autoregressive_input(si, SN, f_hat, h_BChw)
 
+            def __call__(self, x):
+                return self._parent.vq(x)
+
         self.quantize = _Proxy(self)  # lightweight proxy for trainer compatibility
-        self.shapes: List[Tuple[int, int]] = []
+        self.shapes: List[Tuple[int, int, int, int]] = []
 
     @staticmethod
     def _complex_to_quaternion(c: torch.Tensor) -> torch.Tensor:
@@ -88,19 +92,19 @@ class WaveletTokenizer(nn.Module):
 
     @staticmethod
     def _quaternion_to_complex(q: torch.Tensor) -> torch.Tensor:
-        amp, phase = q[..., 2], q[..., 3]
-        real = amp * torch.cos(phase)
-        imag = amp * torch.sin(phase)
+        real, imag = q[..., 0], q[..., 1]
         return torch.stack((real, imag), dim=-1)
 
     def img_to_idxBl(self, img: torch.Tensor) -> List[torch.Tensor]:
         """Decompose image and quantize to token indices."""
+        self.dtcwt = self.dtcwt.to(img.device)
+        self.itcwt = self.itcwt.to(img.device)
         yl, yh = self.dtcwt(img)
         self.shapes = []
         idx_ls: List[torch.Tensor] = []
         for h in yh:
             B, C, O, H, W, _ = h.shape
-            self.shapes.append((C, H, W))
+            self.shapes.append((C, O, H, W))
             q = (
                 self._complex_to_quaternion(h)
                 .permute(0, 3, 4, 2, 1, 5)  # B H W O C 4
@@ -109,32 +113,35 @@ class WaveletTokenizer(nn.Module):
             _, idx, _ = self.vq(q)
             idx_ls.append(idx)
         B, C, H, W = yl.shape
-        self.shapes.append((C, H, W))
-        low = torch.stack(
-            (yl, torch.zeros_like(yl), torch.zeros_like(yl), torch.zeros_like(yl)),
-            dim=-1,
-        )  # B C H W 4
+        amp = yl.abs()
+        phase = torch.zeros_like(yl)
+        self.shapes.append((C, 1, H, W))
+        low = torch.stack((yl, torch.zeros_like(yl), amp, phase), dim=-1)
         _, idx, _ = self.vq(low.permute(0, 2, 3, 1, 4).reshape(B, -1, 4))
         idx_ls.append(idx)
         return idx_ls
 
     def idxBl_to_img(self, ms_idx_Bl: List[torch.Tensor]) -> torch.Tensor:
         """Decode tokens back to image."""
+        device = ms_idx_Bl[0].device
+        self.itcwt = self.itcwt.to(device)
         yh = []
         for i, idx in enumerate(ms_idx_Bl[:-1]):
-            C, H, W = self.shapes[i]
+            C, O, H, W = self.shapes[i]
+            B = idx.shape[0]
             q = (
                 self.embedding(idx)
-                .view(-1, H, W, 6, C, 4)  # B H W O C 4
+                .view(B, H, W, O, C, 4)
                 .permute(0, 4, 3, 1, 2, 5)
             )
             c = self._quaternion_to_complex(q)
             yh.append(c)
-        C, H, W = self.shapes[-1]
+        C, _, H, W = self.shapes[-1]
+        B = ms_idx_Bl[-1].shape[0]
         q_low = (
             self.embedding(ms_idx_Bl[-1])
-            .view(-1, H, W, C, 4)
-            .permute(0, 3, 1, 2, 4)
+            .view(B, H, W, 1, C, 4)
+            .permute(0, 4, 3, 1, 2, 5)
         )
         yl = q_low[..., 0]
         img = self.itcwt((yl, yh))
