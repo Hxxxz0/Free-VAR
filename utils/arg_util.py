@@ -68,7 +68,6 @@ class Args(Tap):
     wavelet: bool = False   # enable wavelet tokenizer
     wlevels: int = 3        # number of wavelet decomposition levels
     wvocab: int = 4096      # wavelet codebook size
-    wpatch: str = ''        # wavelet patch numbers
     
     # data
     pn: str = '1_2_3_4_5_6_8_10_13_16'
@@ -253,20 +252,9 @@ def init_dist_and_get_args():
         args.pn = '1_2_3_4_6_9_13_18_24_32'
     elif args.pn == '1024':
         args.pn = '1_2_3_4_5_7_9_12_16_21_27_36_48_64'
-
     args.patch_nums = tuple(map(int, args.pn.replace('-', '_').split('_')))
     args.resos = tuple(pn * args.patch_size for pn in args.patch_nums)
     args.data_load_reso = max(args.resos)
-
-    if args.wpatch:
-        args.wavelet_patch_nums = tuple(map(int, args.wpatch.replace('-', '_').split('_')))
-    else:
-        args.wavelet_patch_nums = args.patch_nums
-
-    if args.wavelet:
-        args.patch_nums = args.wavelet_patch_nums
-        args.resos = tuple(pn * args.patch_size for pn in args.patch_nums)
-        args.data_load_reso = max(args.resos)
     
     # update args: bs and lr
     bs_per_gpu = round(args.bs / args.ac / dist.get_world_size())
