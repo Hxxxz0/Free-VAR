@@ -8,9 +8,9 @@ from pytorch_wavelets import DTCWTForward, DTCWTInverse
 
 
 class EMAVQ(nn.Module):
-    """Simple EMA vector quantizer operating on quaternion tokens."""
+    """EMA vector-quantiser (now amplitude-phase, D=2)."""
 
-    def __init__(self, vocab_size: int, code_dim: int, decay: float = 0.99, eps: float = 1e-5):
+    def __init__(self, vocab_size: int, code_dim: int = 2, decay: float = 0.99, eps: float = 1e-5):
         super().__init__()
         self.vocab_size = vocab_size
         self.code_dim = code_dim
@@ -30,14 +30,14 @@ class EMAVQ(nn.Module):
             quantized features, indices, vq loss
         """
         B, L, D = feats.shape
-        flat = feats.view(-1, D)
+        flat = feats.reshape(-1, D)      # safe for non-contiguous
         dist = (
             flat.pow(2).sum(1, keepdim=True)
             - 2 * flat @ self.embedding.weight.t()
             + self.embedding.weight.pow(2).sum(1)
         )
         idx = dist.argmin(1)
-        quant = self.embedding(idx).view(B, L, D)
+        quant = self.embedding(idx).reshape(B, L, D)
 
         if self.training:
             one_hot = F.one_hot(idx, self.vocab_size).type(flat.dtype)
@@ -51,21 +51,21 @@ class EMAVQ(nn.Module):
 
         loss = F.mse_loss(quant, feats.detach()) + 0.25 * F.mse_loss(feats, quant.detach())
         quant = feats + (quant - feats).detach()
-        return quant, idx.view(B, L), loss
+        return quant, idx.reshape(B, L), loss
 
 
 class WaveletTokenizer(nn.Module):
-    """Multi-scale wavelet tokenizer using quaternion VQ."""
+    """Multi-scale wavelet tokenizer using amplitude-phase VQ."""
 
     def __init__(self, levels: int = 3, vocab_size: int = 4096):
         super().__init__()
         self.levels = levels
-        self.vq = EMAVQ(vocab_size, 4)
+        self.vq = EMAVQ(vocab_size, 2)   # amp + phase only
         self.embedding = self.vq.embedding
         self.dtcwt = DTCWTForward(J=levels, biort="near_sym_b", qshift="qshift_b")
         self.itcwt = DTCWTInverse(biort="near_sym_b", qshift="qshift_b")
         self.vocab_size = vocab_size
-        self.Cvae = 4  # quaternion dimension
+        self.Cvae = 2  # amp, phase
         class _Proxy:
             def __init__(self, parent: 'WaveletTokenizer'):
                 self._parent = parent
@@ -81,69 +81,70 @@ class WaveletTokenizer(nn.Module):
                 return self._parent.vq(x)
 
         self.quantize = _Proxy(self)  # lightweight proxy for trainer compatibility
-        self.shapes: List[Tuple[int, int, int, int]] = []
 
+    # ---------- new helpers ----------
     @staticmethod
-    def _complex_to_quaternion(c: torch.Tensor) -> torch.Tensor:
-        real, imag = c[..., 0], c[..., 1]
-        amp = (real.pow(2) + imag.pow(2)).sqrt()
+    def _complex_to_ap(c: torch.Tensor) -> torch.Tensor:
+        """(real, imag) → (amp, phase)"""
+        real, imag = c.unbind(-1)
+        amp = torch.sqrt(real ** 2 + imag ** 2)
         phase = torch.atan2(imag, real)
-        return torch.stack((real, imag, amp, phase), dim=-1)
+        return torch.stack((amp, phase), dim=-1)
 
     @staticmethod
-    def _quaternion_to_complex(q: torch.Tensor) -> torch.Tensor:
-        real, imag = q[..., 0], q[..., 1]
+    def _ap_to_complex(ap: torch.Tensor) -> torch.Tensor:
+        """(amp, phase) → (real, imag)"""
+        amp, phase = ap.unbind(-1)
+        real = amp * torch.cos(phase)
+        imag = amp * torch.sin(phase)
         return torch.stack((real, imag), dim=-1)
 
-    def img_to_idxBl(self, img: torch.Tensor) -> List[torch.Tensor]:
+    def img_to_idxBl(self, img: torch.Tensor) -> Tuple[List[torch.Tensor], List[Tuple[int, int, int, int]]]:
         """Decompose image and quantize to token indices."""
-        self.dtcwt = self.dtcwt.to(img.device)
-        self.itcwt = self.itcwt.to(img.device)
         yl, yh = self.dtcwt(img)
-        self.shapes = []
+        shapes_local: List[Tuple[int, int, int, int]] = []
         idx_ls: List[torch.Tensor] = []
         for h in yh:
             B, C, O, H, W, _ = h.shape
-            self.shapes.append((C, O, H, W))
+            shapes_local.append((C, O, H, W))
             q = (
-                self._complex_to_quaternion(h)
-                .permute(0, 3, 4, 2, 1, 5)  # B H W O C 4
-                .reshape(B, -1, 4)
+                self._complex_to_ap(h)
+                .permute(0, 3, 4, 2, 1, 5)  # B H W O C 2
+                .reshape(B, -1, 2)
             )
             _, idx, _ = self.vq(q)
             idx_ls.append(idx)
         B, C, H, W = yl.shape
         amp = yl.abs()
         phase = torch.zeros_like(yl)
-        self.shapes.append((C, 1, H, W))
-        low = torch.stack((yl, torch.zeros_like(yl), amp, phase), dim=-1)
-        _, idx, _ = self.vq(low.permute(0, 2, 3, 1, 4).reshape(B, -1, 4))
+        shapes_local.append((C, 1, H, W))
+        low = torch.stack((amp, phase), dim=-1)
+        _, idx, _ = self.vq(low.permute(0, 2, 3, 1, 4).reshape(B, -1, 2))
         idx_ls.append(idx)
-        return idx_ls
+        return idx_ls, shapes_local
 
-    def idxBl_to_img(self, ms_idx_Bl: List[torch.Tensor]) -> torch.Tensor:
+    def idxBl_to_img(self, ms_idx_Bl: List[torch.Tensor], shapes) -> torch.Tensor:
         """Decode tokens back to image."""
         device = ms_idx_Bl[0].device
-        self.itcwt = self.itcwt.to(device)
         yh = []
         for i, idx in enumerate(ms_idx_Bl[:-1]):
-            C, O, H, W = self.shapes[i]
+            C, O, H, W = shapes[i]
             B = idx.shape[0]
-            q = (
+            ap = (
                 self.embedding(idx)
-                .view(B, H, W, O, C, 4)
+                .reshape(B, H, W, O, C, 2)
                 .permute(0, 4, 3, 1, 2, 5)
-            )
-            c = self._quaternion_to_complex(q)
+        )
+            c = self._ap_to_complex(ap)
             yh.append(c)
-        C, _, H, W = self.shapes[-1]
+        C, _, H, W = shapes[-1]
         B = ms_idx_Bl[-1].shape[0]
-        q_low = (
+        ap_low = (
             self.embedding(ms_idx_Bl[-1])
-            .view(B, H, W, 1, C, 4)
+            .reshape(B, H, W, 1, C, 2)
             .permute(0, 4, 3, 1, 2, 5)
         )
-        yl = q_low[..., 0]
+        yl = self._ap_to_complex(ap_low)[..., 0]          # take real part
         img = self.itcwt((yl, yh))
         return img.clamp(-1, 1)
 
